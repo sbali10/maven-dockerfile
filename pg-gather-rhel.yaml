@@ -1,0 +1,136 @@
+###
+# This is a ansible playbook to collect data for OCP 4 cluster review
+###
+# First we do some sanity checks
+###
+- hosts: all
+  gather_facts: false
+  vars: 
+    total_hosts: "{{groups['new_workers']|length}}"
+
+# check no workers are in new_worker group
+
+  tasks:
+    - when: "'new_workers' in groups"
+      block:
+        - when: total_hosts|int > 0 
+          connection: local
+          run_once: True
+          block:
+            - name: count names in group new_workers
+              debug:
+                msg: "{{ total_hosts }}"
+
+            - name: fail because we have workers in new_workers section
+              fail:
+                msg: "There are nodes defined in new_worker section of your inventory, please comment those nodes or move them accordingly"
+              when: total_hosts|int > 0
+
+# verify we have at least sos version 3.7 or newer as esle the below sos command will not work properly, this may change through times 
+
+    - block:
+        - name: check for installed packages
+          package_facts:
+            manager: auto
+
+        - name: fail when no sosreport is installed at all 
+          fail:
+            msg: " {{ inventory_hostname }} has no sosreport installed, pls make sure at least version sos-3.7-5.el7.noarch is installed"
+          when: ('sos' not in ansible_facts.packages) 
+
+        - name: fail when wrong sosreport version is installed
+          fail:
+            msg: " {{ inventory_hostname }} has too old version  {{ ansible_facts.packages['sos'][0].version|float }}, pls make sure at least version sos-3.7-5.el7.noarch is installed"
+          when: (ansible_facts.packages['sos'][0].version|float < 3.7)
+
+        - name: check if sosreport is installed 
+          debug:
+            msg: "{{ ansible_facts.packages['sos'][0].version|float }} is installed"
+          when: "'sos' in ansible_facts.packages"
+      any_errors_fatal: true
+
+####
+# Actual sampling starts here
+###
+
+# Create temporary working directory on all nodes (we will remove that at the end)"
+
+- hosts:
+    - all
+    - localhost
+  gather_facts: no
+  tasks:
+    - name: create pg_rhel temp directory on all hosts
+      file:
+        path: "/var/tmp/pg_rhel/"
+        mode: 0777
+        state: directory
+
+# collect sosreport 
+
+- hosts: all
+  gather_facts: no
+  tasks:
+  - name: run sosreport on all nodes
+    command: sosreport -o kubernetes -p boot,container,hardware,memory,network,openshift,packagemanager,performance,security,services,storage,sysmgmt,system --batch --tmp-dir /var/tmp/pg_rhel/
+
+# As fetch module is not capable of doing wildcards, get the created file names first
+
+  - name: get sosreport output from nodes
+    find:
+      paths: "/var/tmp/pg_rhel/"
+      patterns: "sos*"
+      use_regex: True
+    register: sosreport_to_fecth
+
+# Fetch the created sosreports to localhost in temp directory
+
+  - name: copy files to localhost
+    fetch:
+      src:  "{{ item.path }}"
+      dest: "/var/tmp/pg_rhel/"
+      flat: yes
+    with_items: "{{ sosreport_to_fecth.files }}"
+
+# create an archive for easy upload
+
+- hosts: localhost
+  gather_facts: no
+  tasks:
+  - name: pack up all collected data and remove collected files locally
+    archive :
+      path: "/var/tmp/pg_rhel/*"
+      dest: "/var/tmp/pg_rhel-out.gz"
+      remove: yes
+
+# remove all tepmorary directories
+
+- hosts: 
+    - all
+    - localhost
+  gather_facts: no
+  tasks:
+  - name: check status of temporary directory on all hosts
+    stat:
+      path: "/var/tmp/pg_rhel"
+    register: temp_dir_stat
+
+  - name: delete pg_rhel directory on all hosts if exists
+    file:
+      path: "/var/tmp/pg_rhel"
+      state: absent
+    when: temp_dir_stat.stat.exists == true 
+
+# print message with the filename to upload
+
+- hosts: localhost
+  gather_facts: no
+  tasks:
+  - name: check status of created archive
+    stat:
+      path: "/var/tmp/pg_rhel-out.gz"
+    register: pg_rhel_out_stat
+  - name: Message for uploading file 
+    debug:
+      msg: "please upload /var/tmp/pg_rhel-out.gz to your case"
+    when: pg_rhel_out_stat.stat.exists == true
